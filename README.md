@@ -67,16 +67,16 @@ weights = optimizer.optimize(
 ## Output Examples
 
 ### Implied PDF Diagnostics
-![Implied PDF Dashboard](plot/Implied PDF Dashboard.png)
+![Implied PDF Dashboard](plot/Implied_PDF_Dashboard.png)
 
 ### Net Gamma Exposure by Strike
 ![GEX](plot/GEX.png)
 
 ### Gamma Profile
-![Gamma Profile](plot/Gamma Profile.png)
+![Gamma Profile](plot/Gamma_Profile.png)
 
 ### Covered Call Optimal Weights
-![Covered Call Heatmap](plot/Covered Call Heatmap.png)
+![Covered Call Heatmap](plot/Covered_Call_Heatmap.png)
 
 ## References
 
