@@ -1,23 +1,22 @@
+import random
 import warnings
 from collections.abc import Iterable
 
-import random
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy as sp
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from scipy import optimize as sco
+from scipy.stats import kurtosis as calc_kurtosis
+from scipy.stats import skew as calc_skew
 
-from optim.utils import init_params, mjd_pdf, sampling
+from optim.utils import sampling
 
 
 class BuyWriteOptimizer:
 
-    def __init__(self, log_ret: pd.Series, dt, Ks, S, T, r, random_seed=42):
-        self.ret_series = log_ret
-        self.ret = log_ret.values
-        self.dt = dt
+    def __init__(self, Ks, S, T, r, random_seed=42):
         self.Ks = Ks
         self.S = S
         self.T = T
@@ -29,6 +28,7 @@ class BuyWriteOptimizer:
         self.optimal_vals = None
         self.Ks_selected = None
         self.calls_selected = None
+        self.posterior = None
 
         self._call_payoff = None
         self._equity_ret = None
@@ -37,105 +37,23 @@ class BuyWriteOptimizer:
         np.random.seed(random_seed)
         random.seed(random_seed)
 
-    def _fit_mjd_params(self, returns):
-        init_guess = init_params(returns, self.dt, threshold=3)
-        res = sco.minimize(mjd_pdf, init_guess,
-                           args=(returns, self.dt, True),
-                           bounds=[(-1, 1), (1e-4, 1), (0, 50), (-1, 1), (1e-4, 1)])
-        return res.x
-
-    def _fit_mjd_regime(self, regime_labels, current_regime,
-                        blend_lambda=0.5, min_regime_obs=60):
-        """
-        국면별 수익률 시계열로 MJD 파라미터 추정
-
-        Args:
-            regime_labels: 수익률 시계열과 같은 길이의 array (0 or 1).
-                           0 = 저변동, 1 = 고변동.
-            current_regime: 현재 국면 (0 or 1)
-            blend_lambda: 국면별 파라미터와 전체 파라미터의 혼합 비율.
-                          1.0 = 국면 파라미터만 사용, 0.0 = 전체 파라미터만 사용.
-            min_regime_obs: 국면별 최소 관측치. 이보다 적으면 blend_lambda 자동 축소.
-
-        """
-
-        common_dates = regime_labels.index.intersection(self.ret_series.index)
-        regime_labels_ = regime_labels.loc[common_dates]
-        ret_series = self.ret_series.loc[common_dates]
-        regime_dates = regime_labels_[regime_labels_ == current_regime].index
-
-        # 전체 기간 피팅
-        params_full = self._fit_mjd_params(self.ret)
-        # 현재 국면에 해당하는 수익률 추출
-        ret_regime = self.ret_series[regime_dates].values
-
-        n_regime = len(ret_regime)
-        if n_regime < 20:
-            # 관측치 너무 적으면 전체 기간 파라미터만 사용
-            warnings.warn(f"Regime obs too few ({n_regime}), using full-sample params")
-            return params_full
-
-        # 국면별 피팅
-        params_regime = self._fit_mjd_params(ret_regime)
-
-        # blend_lambda 자동 조정: 관측치가 min_regime_obs보다 적으면 축소
-        effective_lambda = blend_lambda * min(n_regime / min_regime_obs, 1.0)
-
-        params_blended = effective_lambda * params_regime + (1 - effective_lambda) * params_full
-        return params_blended
-
     def _sampling(self, pdfs, N, random_seed):
-        cdfs = np.array(
-            [sp.integrate.trapezoid(pdfs[:i], self.Ks[:i]) for i in np.arange(len(pdfs))])
-        # dx = np.diff(self.Ks)
-        # mid = 0.5 * (pdfs[:-1] + pdfs[1:])
-        # cdfs = np.concatenate(([0.0], np.cumsum(mid * dx)))
+        # cdfs = np.array(
+        #     [sp.integrate.trapezoid(pdfs[:i], self.Ks[:i]) for i in np.arange(len(pdfs))])
+        """
+        아래 방식이 조금 더 정확함. 사다리꼴 적분 근사.
+        """
+        dx = np.diff(self.Ks)
+        mid = 0.5 * (pdfs[:-1] + pdfs[1:])
+        cdfs = np.concatenate(([0.0], np.cumsum(mid * dx)))
         STs = sampling(cdfs, self.Ks, N=N, add_noise=True, random_seed=random_seed)
         return STs
 
-    def fit(self, pdfs=None, use_parametric=False, N=10000,
-            regime_labels=None, current_regime=None,
-            blend_lambda=0.5, min_regime_obs=60):
+    def fit(self, pdfs, N=10000):
         """
-        PDF 기반 만기 주가 경로 샘플링
-
-        prior (Q-measure):  implied PDF (옵션시장 가격에서 추출)
-        likelihood (P-measure): MJD (과거 수익률 기반, 국면 조건부)
-        posterior: prior × likelihood → 샘플링 대상
-
-        Args:
-            pdfs: implied PDF (None이면 parametric only)
-            use_parametric: MJD parametric PDF 사용 여부
-            N: 샘플 수
-            regime_labels: 수익률 시계열과 같은 길이의 0/1 array (저변동/고변동)
-            current_regime: 현재 국면 (0 or 1). regime_labels와 함께 사용.
-            blend_lambda: 국면 파라미터 혼합 비율 (1.0=국면only, 0.0=전체only)
-            min_regime_obs: 국면별 최소 관측치 (이하면 blend_lambda 자동 축소)
+        Implied PDF 기반 만기 주가 경로 샘플링.
         """
-        if pdfs is None:
-            use_parametric = True
-        else:
-            pdfs = pdfs / sp.integrate.trapezoid(pdfs, self.Ks)
-
-        if use_parametric:
-            # 국면 정보가 있으면 조건부 피팅, 없으면 전체 피팅
-            if regime_labels is not None and current_regime is not None:
-                params = self._fit_mjd_regime(regime_labels, current_regime,
-                                              blend_lambda, min_regime_obs)
-            else:
-                params = self._fit_mjd_params(self.ret)
-
-            # MJD로 P-measure PDF 생성
-            pdfs_parametric = mjd_pdf(params, log_ret=np.log(self.Ks / self.S),
-                                      dt=self.T, nll=False)
-
-            # posterior = P × Q (또는 P only)
-            if pdfs is not None:
-                posterior = pdfs_parametric * pdfs
-                pdfs = posterior / sp.integrate.trapezoid(posterior, self.Ks)
-            else:
-                pdfs = pdfs_parametric
-
+        pdfs = pdfs / sp.integrate.trapezoid(pdfs, self.Ks)
         self.STs = self._sampling(pdfs, N, self.random_seed)
         self.fitted = True
 
@@ -147,41 +65,31 @@ class BuyWriteOptimizer:
 
         self._equity_ret = ((self.STs - self.S) / self.S).astype(np.float32)
 
-    def _objective(self, x, risk_aversion):
+    def _objective(self, x, risk_aversion, bm_exposure=1.0, timing_penalty=0):
         weighted = self._call_payoff @ x  # (N_paths,)
         ris = self._equity_ret + weighted / self.S
-        er = ris.mean()
-        var = ris.var(ddof=1)
-        return -er * (1 - risk_aversion) + var * risk_aversion
-
-    def _objective_robust(self, x, risk_aversion, epsilon=0.05):
-        """
-        Robust optimization: CVaR penalty로 PDF 추정 오차 고려.
-
-        기본 objective + epsilon * CVaR(5%) penalty.
-        tail 리스크에 대한 보수적 조정.
-        """
-        weighted = self._call_payoff @ x
-        ris = self._equity_ret + weighted / self.S
+        if bm_exposure is not None:
+            ris_bm = self._equity_ret * bm_exposure
+            ris = ris - ris_bm
         er = ris.mean()
         var = ris.var(ddof=1)
 
-        # CVaR (Expected Shortfall) at 5%
-        n_tail = max(int(len(ris) * 0.05), 1)
-        cvar = -np.partition(ris, n_tail)[:n_tail].mean()  # partial sort (faster than full sort)
+        # Ref Paper: Covered Calls Uncovered
+        timing_var=  0
+        if timing_penalty > 0:
+            delta_scenarios = (self.STs[:, np.newaxis] > self.Ks_selected).astype(np.float32) @ x
+            delta_mean = delta_scenarios.mean()
+            timing_var = ((delta_scenarios - delta_mean) ** 2 * self._equity_ret ** 2).mean()
 
-        base_obj = -er * (1 - risk_aversion) + var * risk_aversion
-        return base_obj + epsilon * cvar
+        return -er * (1 - risk_aversion) + var * risk_aversion + timing_var * timing_penalty
 
-    def _objective_for_scipy(self, x, risk_aversion, robust, epsilon):
+    def _objective_for_scipy(self, x, risk_aversion, bm_exposure, timing_penalty):
         """scipy.optimize용 wrapper"""
-        if robust:
-            return self._objective_robust(x, risk_aversion, epsilon)
-        return self._objective(x, risk_aversion)
+        return self._objective(x, risk_aversion, bm_exposure, timing_penalty)
 
     # ================================================================ Optimize
     def optimize(self, price, mnys, risk_aversion=0.5, tcr=None,
-                 n_simul=1000, n_core=4, robust=False, epsilon=0.05):
+                 n_simul=1000, n_core=4, bm_exposure=None, timing_penalty=0):
         """
         Args:
             price: fitted call price array (from PDF model)
@@ -190,8 +98,6 @@ class BuyWriteOptimizer:
             tcr: total cover ratio (비중 합 상한). None이면 1.
             n_simul: brute-force 시뮬 수. None이면 COBYLA.
             n_core: 병렬 코어 수 (brute-force에만 사용)
-            robust: robust optimization (CVaR penalty) 사용 여부
-            epsilon: robust penalty 강도
         """
         if not self.fitted:
             raise ValueError(".fit() 먼저")
@@ -215,7 +121,6 @@ class BuyWriteOptimizer:
         self._compute_payoffs(calls_selected, Ks_selected)
 
         ndim = len(mnys)
-        upper = tcr if tcr is not None else 1.0
 
         if n_simul is not None:
             from joblib import Parallel, delayed
@@ -225,23 +130,27 @@ class BuyWriteOptimizer:
                 for ra in risk_aversion
             )
         else:
-            # ---- COBYLA path with warm-start ----
-            bounds = [(0, upper)] * ndim
-            constraints = [{'type': 'ineq', 'fun': lambda x: upper - np.sum(x)}]
+            bounds = [(0, 1)] * ndim
+            if tcr is None:
+                upper = 1
+                constraints = [{'type': 'ineq', 'fun': lambda x: upper - np.sum(x)}]
+            else:
+                constraints = [{'type': 'eq', 'fun': lambda x: tcr - np.sum(x)}]
 
             res = []
             x_prev = np.zeros(ndim)
+            cobyla_option = {'maxiter': 10000, 'rhobeg': 0.1, 'tol': 1e-10}
+            slsqp_option = {'maxiter': 10000, 'ftol': 1e-12}
 
             for ra in risk_aversion:
                 result = sco.minimize(
                     fun=self._objective_for_scipy,
                     x0=x_prev,
-                    args=(ra, robust, epsilon),
+                    args=(ra, bm_exposure, timing_penalty),
                     bounds=bounds,
                     constraints=constraints,
-                    method='COBYLA',
-                    options={'maxiter': 10000, 'rhobeg': 0.1},
-                    tol=1e-10,
+                    method='SLSQP' if tcr is not None else 'COBYLA',
+                    options=slsqp_option if tcr is not None else cobyla_option
                 )
                 x_prev = result.x.copy()  # warm-start for next λ
                 res.append((result.x, result.fun))
@@ -278,27 +187,27 @@ class BuyWriteOptimizer:
         best_idx = objs.argmin()
         return ps[best_idx], objs[best_idx]
 
-    def analyze_solution(self, risk_aversion_idx=None):
+    def analyze_solution(self, risk_aversion=None):
         if self.sols is None:
             raise ValueError("optimize() 먼저")
 
-        if risk_aversion_idx is None:
-            risk_aversion_idx = len(self.sols) // 2
+        if risk_aversion is None:
+            risk_aversion = self.sols.index[len(self.sols) // 2]
 
-        x = self.sols.iloc[risk_aversion_idx].values
+        x = self.sols.loc[risk_aversion].values
         weighted = self._call_payoff @ x
         ris = self._equity_ret + weighted / self.S
 
         return {
-            'weights': self.sols.iloc[risk_aversion_idx],
-            'expected_return': float(ris.mean()),
-            'volatility': float(ris.std()),
-            'sharpe': float(ris.mean() / ris.std()) if ris.std() > 0 else 0,
+            'weights': self.sols.loc[risk_aversion],
+            'expected_return': float(ris.mean() * (1 / self.T)),
+            'volatility': float(ris.std() * np.sqrt((1 / self.T))),
+            'sharpe': (float(ris.mean() / ris.std()) * np.sqrt(1 / self.T)) if ris.std() > 0 else 0,
             'max_loss': float(ris.min()),
             'var_95': float(np.percentile(ris, 5)),
             'cvar_95': float(ris[ris <= np.percentile(ris, 5)].mean()),
-            'skewness': float(sp.stats.skew(ris)),
-            'kurtosis': float(sp.stats.kurtosis(ris)),
+            'skewness': float(calc_skew(ris)),
+            'kurtosis': float(calc_kurtosis(ris)),
         }
 
     def plot_heatmap(self, annualize=True, figsize=(12, 7), cmap='YlOrRd',
@@ -335,7 +244,6 @@ class BuyWriteOptimizer:
         for i in range(data.shape[0]):
             for j in range(data.shape[1]):
                 val = data.values[i, j]
-                text = format(val, fmt.replace('.', '.').lstrip('.'))
                 # fmt 파싱: 기본은 percentage
                 if '%' in fmt:
                     text = f'{val:{fmt}}'
@@ -364,3 +272,88 @@ class BuyWriteOptimizer:
         fig.tight_layout()
         plt.savefig(f'{save_path}Covered Call Heatmap.png')
         plt.show()
+
+    def plot_return_distribution(self, risk_aversion=None, bins=100,
+                                 figsize=(12, 6), save_path='plot/'):
+        """
+        주식 단독 보유 vs 커버드콜 포지션의 수익률 분포 비교.
+
+        Args:
+            bins: 히스토그램 bin 수
+            figsize: 그림 크기
+            save_path: 저장 경로
+        """
+        if self.sols is None:
+            raise ValueError("optimize() 먼저")
+
+        if risk_aversion is None:
+            risk_aversion = self.sols.index[len(self.sols) // 2]
+
+        x = self.sols.loc[risk_aversion].values
+        weighted = self._call_payoff @ x
+        cc_ret = self._equity_ret + weighted / self.S
+        eq_ret = self._equity_ret
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        # ---- 왼쪽: 겹친 히스토그램 ----
+        ax = axes[0]
+        ax.hist(eq_ret, bins=bins, alpha=0.4, color='#3b82f6', label='Equity Only', density=True)
+        ax.hist(cc_ret, bins=bins, alpha=0.5, color='#ef4444', label='Covered Call', density=True)
+
+        ax.axvline(eq_ret.mean(), color='#3b82f6', linestyle='--', linewidth=1.2)
+        ax.axvline(cc_ret.mean(), color='#ef4444', linestyle='--', linewidth=1.2)
+
+        ax.set_xlabel('Return', fontsize=10)
+        ax.set_ylabel('Density', fontsize=10)
+        ax.set_title('Return Distribution', fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.2)
+
+        # ---- 오른쪽: 통계 비교 ----
+        ax2 = axes[1]
+        ax2.axis('off')
+
+        stats = [
+            ('', 'Equity', 'Covered Call'),
+            ('E[R]', f'{eq_ret.mean() * (1 / self.T) :.2%}', f'{cc_ret.mean() * (1 / self.T):.2%}'),
+            ('Std', f'{eq_ret.std() * np.sqrt((1 / self.T)) :.2%}', f'{cc_ret.std() * np.sqrt((1 / self.T)):.2%}'),
+            ('Sharpe', f'{(eq_ret.mean() / eq_ret.std()) * np.sqrt((1 / self.T))  :.3f}' if eq_ret.std() > 0 else '-',
+             f'{(cc_ret.mean() / cc_ret.std()) * np.sqrt((1 / self.T)):.3f}' if cc_ret.std() > 0 else '-'),
+            ('VaR 5%', f'{np.percentile(eq_ret, 5):.4%}', f'{np.percentile(cc_ret, 5):.4%}'),
+            ('CVaR 5%', f'{eq_ret[eq_ret <= np.percentile(eq_ret, 5)].mean():.4%}',
+             f'{cc_ret[cc_ret <= np.percentile(cc_ret, 5)].mean():.4%}'),
+            ('Max Loss', f'{eq_ret.min():.4%}', f'{cc_ret.min():.4%}'),
+            ('Skew', f'{calc_skew(eq_ret):.3f}', f'{calc_skew(cc_ret):.3f}'),
+            ('Kurtosis', f'{calc_kurtosis(eq_ret):.3f}', f'{calc_kurtosis(cc_ret):.3f}'),
+        ]
+
+        table = ax2.table(
+            cellText=[row for row in stats],
+            colWidths=[0.3, 0.35, 0.35],
+            loc='center',
+            cellLoc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.5)
+
+        # 헤더 스타일
+        for j in range(3):
+            table[0, j].set_facecolor('#334155')
+            table[0, j].set_text_props(color='white', fontweight='bold')
+
+        for i in range(1, len(stats)):
+            table[i, 0].set_text_props(fontweight='bold')
+
+        ax2.set_title(f'Risk Metrics (λ={risk_aversion:.2f})', fontsize=12)
+
+        fig.suptitle(
+            f'Covered Call Analysis  (S={self.S:,.0f}, T={self.T:.2f}, Σ={x.sum():.0%})',
+            fontsize=13, y=0.98
+        )
+        fig.tight_layout()
+        plt.savefig(f'{save_path}Return Distribution.png', bbox_inches='tight')
+        plt.show()
+
+        return fig, axes
