@@ -1,6 +1,6 @@
 # option probability portfolio
 
-Extract risk-neutral probability distributions from option chains and optimize covered call strike allocation using Monte Carlo simulation with Merton Jump-Diffusion dynamics.
+Extract risk-neutral probability distributions from option chains and optimize covered call strike allocation using Monte Carlo simulation.
 
 ---
 
@@ -8,7 +8,7 @@ Extract risk-neutral probability distributions from option chains and optimize c
 
 ```
 Option Chain → IV Surface Fitting → Breeden-Litzenberger PDF → Monte Carlo Sampling → Covered Call Optimization
-                (SABR / SVI)           ∂²C/∂K²                  (Implied × MJD)         Mean-Variance + CVaR
+                (SABR / SVI)           ∂²C/∂K²                  (Inverse CDF)            Mean-Variance
 ```
 
 ## Core Mathematics
@@ -27,13 +27,9 @@ Compute variance, skewness, and kurtosis directly from OTM option prices — no 
 
 ### 3. Covered Call Objective
 
-$$\min_{\mathbf{x}} \; -(1-\lambda)\,\mathbb{E}[R] + \lambda\,\text{Var}[R] + \varepsilon \cdot \text{CVaR}_\alpha[R]$$
+$$\min_{\mathbf{x}} \; -(1-\lambda)\,\mathbb{E}[R] + \lambda\,\text{Var}[R] + \eta\,\text{Var}_{\text{timing}}[R]$$
 
-Terminal prices $S_T$ are sampled from the posterior of the implied PDF (Q-measure) and a Merton Jump-Diffusion model (P-measure):
-
-$$p(S_T) \propto q(S_T) \times f_{\text{MJD}}(S_T \mid \mu, \sigma, \lambda, \mu_J, \sigma_J)$$
-
-MJD parameters are estimated conditionally on the current volatility regime, then blended with full-sample estimates.
+Terminal prices $S_T$ are sampled directly from the implied PDF via inverse CDF sampling. Following Israelov & Nielsen (2015), the covered call return is decomposed into passive equity, short volatility, and dynamic equity (equity timing) components. The timing variance term penalizes uncompensated equity reversal exposure arising from option convexity.
 
 ## Usage
 
@@ -46,21 +42,20 @@ model = OptionImpliedPDF(option_chain_df, rf=0.035, dividend=0.0138)
 model.fit(method='sabr', mny_bounds=(0.15, 0.15), check_arbitrage=True)
 
 # 2. Optimize covered call
-optimizer = BuyWriteOptimizer(log_ret, dt=1/252, Ks=model.Ks, S=model.S, T=T, r=rf)
-optimizer.fit(pdfs=model.pdf.values, use_parametric=True, N=100_000)
+optimizer = BuyWriteOptimizer(Ks=model.Ks, S=model.S, T=T, r=rf)
+optimizer.fit(pdfs=model.pdf.values, N=100_000)
 weights = optimizer.optimize(
     price=model.price,
     mnys=target_strikes / S,
     risk_aversion=np.arange(0.1, 1.0, 0.1),
-    robust=True,
 )
 ```
 
 ## Key Features
 
 - **IV Surface Fitting**: SABR, SVI, and PCHIP interpolation with automatic arbitrage detection and correction
-- **Regime-Aware MJD**: Volatility-regime-conditional parameter estimation blended with full-sample estimates
-- **Robust Optimization**: CVaR penalty to guard against PDF estimation error in the tails
+- **Implied PDF Sampling**: Inverse CDF sampling from the risk-neutral density with trapezoid integration
+- **Mean-Variance Optimization**: Risk aversion sweep across strike allocations with total cover ratio constraint
 - **Solver Options**: Brute-force Monte Carlo (parallelized) or COBYLA with warm-start across risk aversion levels
 - **Greeks Monitor**: GEX, VEX, gamma/vanna profiles, and flip point computation
 
@@ -84,7 +79,7 @@ weights = optimizer.optimize(
 - Bakshi, Kapadia & Madan (2003) — *Stock Return Characteristics, Skew Laws, and Differential Pricing*
 - Hagan et al. (2002) — *Managing Smile Risk* (SABR)
 - Gatheral & Jacquier (2014) — *Arbitrage-Free SVI Volatility Surfaces*
-- Merton (1976) — *Option Pricing When Underlying Stock Returns Are Discontinuous*
+- Israelov & Nielsen (2015) — *Covered Calls Uncovered* (equity timing decomposition)
 
 ## License
 
