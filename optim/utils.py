@@ -18,6 +18,16 @@ def sampling(cdfs, strike, N, add_noise=True, noise_std=0.005, random_seed=42):
     return sampled_K
 
 
+def skewt_pdf(x, df, alpha, loc, scale):
+    """Azzalini-Capitanio skew-t PDF."""
+    z = (x - loc) / scale
+    pdf_t = stats.t.pdf(z, df) / scale
+    cdf_factor = stats.t.cdf(
+        alpha * z * np.sqrt((df + 1) / (df + z ** 2)), df + 1
+    )
+    return 2 * pdf_t * cdf_factor
+
+
 def simulate_merton(S0, mu, sigma, lambda_jump, mu_jump, sigma_jump, n_steps, dt, n_paths=100):
     S = np.zeros((n_steps + 1, n_paths))
     S[0, :] = S0
