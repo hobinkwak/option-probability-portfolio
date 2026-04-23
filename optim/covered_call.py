@@ -32,6 +32,7 @@ class BuyWriteOptimizer:
 
         self._call_payoff = None
         self._equity_ret = None
+        self._itm_indicator = None
 
         self.random_seed = random_seed
         np.random.seed(random_seed)
@@ -64,6 +65,8 @@ class BuyWriteOptimizer:
         ).astype(np.float32)
 
         self._equity_ret = ((self.STs - self.S) / self.S).astype(np.float32)
+        # timing용: 시나리오별 행사가별 ITM indicator
+        self._itm_indicator = (self.STs[:, np.newaxis] > Ks).astype(np.float32)
 
     def _objective(self, x, risk_aversion, bm_exposure=1.0, timing_penalty=0):
         weighted = self._call_payoff @ x  # (N_paths,)
@@ -74,10 +77,10 @@ class BuyWriteOptimizer:
         er = ris.mean()
         var = ris.var(ddof=1)
 
-        # Ref Paper: Covered Calls Uncovered
-        timing_var=  0
+        # Ref Paper: Covered Calls Uncovered (2015)
+        timing_var = 0
         if timing_penalty > 0:
-            delta_scenarios = (self.STs[:, np.newaxis] > self.Ks_selected).astype(np.float32) @ x
+            delta_scenarios = self._itm_indicator @ x
             delta_mean = delta_scenarios.mean()
             timing_var = ((delta_scenarios - delta_mean) ** 2 * self._equity_ret ** 2).mean()
 
