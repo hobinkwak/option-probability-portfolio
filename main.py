@@ -3,11 +3,10 @@ import warnings
 import numpy as np
 import pandas as pd
 import scipy as sp
-import yfinance as yf
 
+from monitor import OptionChainMonitor
 from optim import BuyWriteOptimizer
 from pdf import OptionImpliedPDF
-from monitor import OptionChainMonitor
 
 warnings.simplefilter("ignore")
 
@@ -21,13 +20,10 @@ ocs_all['EXPIRE_DATE'] = pd.to_datetime(ocs_all['EXPIRE_DATE'])
 ocs = ocs_all.loc[ocs_all.EXPIRE_DATE.isin([target_exp])]
 ocs = ocs.loc[ocs.SYMBOL == 'SPX']
 
-spx = yf.download('^GSPC', start="1900-1-1", end=None)['Close']
-spx_rtn = spx.pct_change().iloc[1:]
-
 div_yld = 1.38 * 0.01
 rf = 3.5 * 0.01
 
-# Option Chain Monitor #
+################### Option Chain Monitor ###################
 
 chain_model = OptionChainMonitor(ocs, rf, div_yld)
 gex = chain_model.compute_gex()
@@ -57,13 +53,13 @@ res.columns = ['S', 'HighGex', 'HighGex/S', 'LowGex', 'LowGex/S', 'NetGex(1B$)',
                'VANNA Flip', 'VANNA Flip/S']
 print(res)
 
-# Implied PDF #
+################### Implied PDF ###################
 
 model_params = {
     'method': 'sabr',
     'filter_iv_sigma': None,
     'K_interval': 0.5,
-    'mny_bounds': (0.15, 0.15),
+    'mny_bounds': (0.125, 0.125),
     'filter_pdf_sigma': None,
     'maximum_q': 1.0,
     'flatten': True,  # 안 건드려도 됨
@@ -82,55 +78,50 @@ print(pd.DataFrame([[prob_model.S, ev, (ev / prob_model.S - 1) * 100, biggest_pr
                      (biggest_prob_k / prob_model.S - 1) * 100]],
                    columns=['S', 'EV', 'EV/S', 'HighProb', 'HighProb/S']).round(2))
 
-# Covered Call Optimization #
-dt = 1 / 252
+################## Covered Call Optimization ###################
 S, T = prob_model.S, prob_model.oc_raw['T'].unique()[0]
 Ks, price = prob_model.Ks, prob_model.price
 Ks_oc_raw = ocs['STRIKE'].values
 price_oc_raw = ocs['C_MID'].values
 mny_pools = Ks_oc_raw / S
 
-target_mnys = np.arange(7150, 7300, 5) / S
-log_ret = np.log(spx / spx.shift(1)).loc[None:target_date].iloc[1:].squeeze()
-ivol_regime = pd.read_csv('sample_data/vol regime (high_vol=1).csv', index_col=[0], parse_dates=[0]).squeeze()
-
+target_mnys = np.arange(7150, 7500, 25) / S
 target_idx = np.searchsorted(mny_pools, target_mnys, 'left')
 Ks_selected = Ks_oc_raw[target_idx]
 calls_selected = price_oc_raw[target_idx]
 
 random_seed = 42
-port_model = BuyWriteOptimizer(log_ret, dt, Ks, S, T, rf, random_seed)
+port_model = BuyWriteOptimizer(Ks, S, T, rf, random_seed)
 port_fit_params = {
     'pdfs': prob_model.pdf.values,
-    'use_parametric': True,
     'N': int(1e5),
-    'regime_labels': ivol_regime,
-    'current_regime': 0  # 1: high vol , 0: low vol (defined in ivol_regime)
 }
 port_model.fit(**port_fit_params)
 
-risk_aversions = np.arange(0.1, 1, 0.1)
+risk_aversions = np.arange(0.0, 1.1, 0.1)
 port_optim_params = {
     "price": price,
     "mnys": Ks_selected / S,
     "risk_aversion": risk_aversions,
-    "tcr": None,
-    "n_core": 12,
-    'robust': False,
+    "tcr": 1,
+    "n_core": 20,
     'n_simul': None,
+    'bm_exposure': None,
+    'timing_penalty': 0.1,
 }
-
 port_model.optimize(**port_optim_params)
 port_model.plot_heatmap()
 sols = port_model.sols
 sols.columns = Ks_selected
 print(sols.loc[:, sols.sum(axis=0) > 0])
 
+port_model.plot_return_distribution(risk_aversion=0.1, figsize=(12, 6))
+
 sols_dfs = pd.DataFrame()
-for i in range(len(risk_aversions)):
+for ra in risk_aversions:
     sols_df = pd.DataFrame(
-        [tup for tup in port_model.analyze_solution(risk_aversion_idx=i).items() if tup[0] != 'weights'],
-        columns=['metric', risk_aversions[i]])
+        [tup for tup in port_model.analyze_solution(risk_aversion=ra).items() if tup[0] != 'weights'],
+        columns=['metric', ra])
     sols_df = sols_df.set_index('metric')
     sols_dfs = pd.concat([sols_dfs, sols_df], axis=1)
 print(sols_dfs)
