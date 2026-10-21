@@ -5,3 +5,4 @@ matplotlib>=3.6
 pysabr>=0.3
 joblib>=1.2
 scikit-learn>=1.1
+# calib/dataset.py needs an external data loader (preprocess.DataLoader) and daily option chain CSVs (environment variables OPP_DATA_ROOT, OPP_CHAIN_DIR)
